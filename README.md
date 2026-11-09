@@ -11,7 +11,7 @@ Create purchase orders in Google Docs and monthly summaries in Google Sheets. Th
 | Working spreadsheet ID | Read automatically from the spreadsheet where you run Purchase Tools. |
 | Order template, Received Log, and output folder IDs | Resolved automatically in Drive. The initializer finds or creates the named assets in the main purchase folder and places the working Sheet in `General_Purchase_Orders`. Keep the names and nesting shown below. |
 | Other project spreadsheet IDs | **Sync projects in this folder** reads the IDs of the workbooks you select and saves them in their private **Projects** tabs. |
-| Grant number | Enter it in **Initialize workbook**. It is stored in `Amazon!A1`. |
+| Grant number | Enter it in **Initialize workbook**. It is stored in `Control!B5`, and every vendor tab displays it in `A1`. |
 | Project name and project code | Enter both in the same dialog. They are stored in `Control!B3` and `Control!B4`. Use a unique code of 2–10 letters or digits for each project. |
 
 The portable version builds the blank workbook and a Stage 1-style order document from code. The order, summary, and project-sync workflows carry over to the portable version.
@@ -32,7 +32,7 @@ Workbook setup and monthly report generation use the **United States spreadsheet
 
    Once the menu appears, run **Purchase Tools → Initialize Drive templates and folders** and authorize the script when prompted. It creates the missing subfolders and templates, including Received Log, then moves the working Sheet into `General_Purchase_Orders`. For additional workbooks, either start in the main folder and run the initializer again or create the workbook directly inside the existing `General_Purchase_Orders` folder.
 4. Run **Purchase Tools → Initialize workbook**. Enter the grant number, project name, and unique 2–10 character project code, then click **Continue**. This builds the vendor tabs, `Control`, and `Projects` from code in a blank workbook. It adds links to the shared Drive assets and installs the edit trigger for Received Log when available. Use an account that can edit the shared Log. Initialization removes the empty starter tab (`Sheet1` in English) after the new tabs are ready. The script is attached to the workbook.
-5. Verify the grant in `Amazon!A1`, the project name in `Control!B3`, and the project code in `Control!B4`. Add a sample purchase on a vendor tab and generate an order and a monthly summary before using the workbook for production.
+5. Verify the grant in `Control!B5`, the project name in `Control!B3`, and the project code in `Control!B4`. Add a sample purchase on a vendor tab and generate an order and a monthly summary before using the workbook for production.
 
 ```text
 Your purchase folder/
@@ -52,7 +52,15 @@ The **Control** tab links to the order output, monthly summaries, summary archiv
 
 To apply the Stage 1 order spacing to an existing installation, update the script and rerun **Initialize Drive templates and folders**. It updates `Template_form` when its body text matches either older generated layout. If you customized only the styling of an older layout, save a copy of the template before rerunning the initializer. The update applies to newly generated orders.
 
-The generated order template uses the Stage 1 layout, with company and grant at the top, followed by category and item count, then each item’s link, unit cost, quantity, subtotal, and the order total. Templates with customized text are preserved.
+The generated order template uses the Stage 1 layout, with company and grant at the top, followed by category and item count, then each item’s link, unit cost, quantity, subtotal, and the order total. Templates with customized text are preserved. Drive initialization also refreshes the blank workbook template with the grant field in `Control!B5`. Each working workbook gets the latest commands when you replace its script and reload.
+
+## Manage vendor tabs
+
+The vendor commands appear in **Purchase Tools** below **Sync projects in this folder**, in the order **Add**, **Remove**, **Rename**.
+
+- **Add vendor tab** when a company needs its own purchase tab. Run it from any tab and enter the company name and a unique code of 2–6 letters or digits. The code is saved in uppercase and used in the Item number. The new tab starts blank with the standard layout, grant link, and formulas. Orders, monthly summaries, workbook checks, and Received Log recognize it automatically. For occasional purchases, use **Others** and enter the company on the purchase row.
+- **Remove vendor tab** when you no longer need Amazon or a custom vendor tab and are ready to delete its purchase rows. Open the target tab, verify its name in the warning, and type `DELETE_TAB` exactly. The command updates the Item number formulas that reference the tab. Workbook repair treats a menu removal as intentional. Saved orders, reports, archives, and log entries remain available, while future or regenerated summaries omit the deleted rows. Keep the other built-in tabs.
+- **Rename vendor tab** to correct a company name or repurpose an empty regular vendor tab. Open the target tab and review the prefilled name and code. Keep the code to retain the existing Item number prefix. Changing the code updates the visible Item numbers, while fixed Purchase Record IDs stay with their rows. Future orders, summaries, and log entries use the new name, including for purchases already on the tab. Saved files and existing log entries retain the original name. On regeneration, a Department total under the former name stays in the archive if no matching vendor remains. Amazon can be renamed. Others and Shipment keep their names because they have special roles.
 
 ## Use
 
@@ -71,7 +79,10 @@ The generated order template uses the Stage 1 layout, with company and grant at 
 
 ## Upgrade an existing portable workbook
 
-Replace the script in each working workbook, save, and reload Sheets. Run **Initialize Drive templates and folders** if shared assets are missing or you want to refresh the generated blank template. Then use **Check / repair workbook** in existing workbooks. Change project settings directly in `Amazon!A1` and `Control!B3:B4` if needed.
+1. In each existing working workbook, open **Extensions → Apps Script**, replace the old script with the current `PurchaseTemplate.gs`, save, and reload the spreadsheet.
+2. Run **Purchase Tools → Check / repair workbook**. If `Control!B5` is blank, repair copies the legacy grant from `Amazon!A1` before replacing vendor grant cells with links to Control. A grant already entered in `Control!B5` takes precedence.
+3. Verify the grant in `Control!B5` and confirm that vendor tabs display it in `A1`. If the original Amazon tab was already removed or its grant is missing, enter the grant directly in `Control!B5`. If Amazon was renamed manually before the upgrade, restore its original name before repair, then rename it through Purchase Tools. Project name and code remain in `Control!B3:B4`.
+4. Run **Initialize Drive templates and folders** if shared assets are missing or you want to refresh the blank workbook template. Use **Initialize workbook** when starting a blank working workbook.
 
 **Check / repair workbook** checks vendor tabs in batches and writes repairs only where needed. It restores grant links, missing Purchase Record IDs, Item number formulas on purchase rows, and the script's Paid and Arrived color rule. It samples validation on the first and last active rows and repairs the affected column if those checks fail. A one-off validation change between the samples may go undetected.
 

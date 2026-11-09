@@ -123,6 +123,7 @@ test('department reconciliation reads legacy entries and skips calculated totals
 
 function sheet(name) {
   const rows = new Map();
+  const metadata = [];
   let writes=0;
   const range = (row, column, height = 1, width = 1) => {
     if (typeof row === 'string') {
@@ -161,6 +162,12 @@ function sheet(name) {
   };
   return {
     getName: () => name, getRange: range, getMaxRows: () => 30,
+    getDeveloperMetadata: () => metadata,
+    addDeveloperMetadata(key,value) {
+      const entry={getKey:()=>key,getValue:()=>value,setValue:next=>{value=next;},
+        remove:()=>metadata.splice(metadata.indexOf(entry),1)};
+      metadata.push(entry);
+    },
     getLastRow: () => Math.max(0,...rows.keys()),
     getWriteCount: () => writes,
     setName(value) { name = value; return this; },
@@ -200,6 +207,87 @@ test('the portable schema creates all tabs and preserves existing project settin
   control.getRange('B3:B4').setValues([['Example project'], ['DEMO']]);
   purchase.format(book);
   assert.deepEqual(control.getRange('B3:B4').getDisplayValues(), [['Example project'], ['DEMO']]);
+});
+
+test('custom vendor registration creates a blank tab and uses its code in formulas', () => {
+  const validation = {
+    requireValueInList: () => validation, requireDate: () => validation,
+    setAllowInvalid: () => validation, setHelpText: () => validation, build: () => ({})
+  };
+  const purchase = app({SpreadsheetApp:{newDataValidation: () => validation, flush() {}}});
+  const tabs = new Map();
+  const book = {
+    getSheets: () => [...tabs.values()], getSheetByName: name => tabs.get(name),
+    insertSheet(name) { const sh = sheet(name); tabs.set(name,sh); return sh; },
+    deleteSheet(sh) { tabs.delete(sh.getName()); }
+  };
+  purchase.format(book);
+  purchase.project = () => ({name:'Demo',code:'DEMO'});
+  for (const method of ['restoreFinalPrice','prepareTracking','styleVendor','statusFormat']) purchase[method] = () => {};
+  assert.throws(() => purchase.addVendor(book,{name:'New Lab',code:'AMZ'}), /already in use/);
+  assert.equal(tabs.has('New Lab'), false);
+  assert.equal(purchase.addVendor(book,{name:'New Lab',code:'nlb'}), 'Created New Lab (NLB).');
+  const tab = tabs.get('New Lab');
+  assert.equal(purchase.isVendor(tab), true);
+  assert(purchase.vendorNames(book).includes('New Lab'));
+  assert.equal(tab.getRange('A1').getFormula(), purchase.grantFormula);
+  assert.match(tab.getRange('A4').getFormula(), /"NLB"/);
+  assert.equal(tab.getRange('D4').getDisplayValue(), '');
+  purchase.ids(book);
+  assert.match(tabs.get('Others').getRange('A4').getFormula(), /'New Lab'!/);
+  assert.throws(() => purchase.addVendor(book,{name:'Other Lab',code:'NLB'}), /already in use/);
+  tab.getSheetId = () => 123;
+  const removal = {tab:'New Lab',id:123,confirmation:'DELETE_TAB'};
+  assert.throws(() => purchase.removeVendor(book,{...removal,confirmation:'delete_tab'}), /exactly/);
+  assert.throws(() => purchase.removeVendor(book,{...removal,id:124}), /tab changed/);
+  assert.throws(() => purchase.removeVendor(book,{...removal,tab:'Others'}), /custom vendor tab/);
+  const deleteSheet = book.deleteSheet;
+  book.deleteSheet = () => { throw Error('Delete denied'); };
+  assert.throws(() => purchase.removeVendor(book,removal), /Delete denied/);
+  assert.match(tabs.get('Others').getRange('A4').getFormula(), /'New Lab'!/);
+  book.deleteSheet = deleteSheet;
+  assert.equal(purchase.removeVendor(book,removal), 'Removed New Lab.');
+  assert.equal(tabs.has('New Lab'), false);
+  for (const name of ['Others','Shipment']) {
+    const sh = tabs.get(name);
+    assert.doesNotMatch(sh.getRange(purchase.layout(sh).first,1).getFormula(), /'New Lab'!/);
+  }
+  const vendor=tabs.get('Thorlabs');
+  const setName=vendor.setName;
+  vendor.getSheetId=()=>456;
+  vendor.setName=value=>{
+    tabs.delete(vendor.getName());
+    setName.call(vendor,value);
+    tabs.set(value,vendor);
+  };
+  vendor.getRange('D4').setValue('Existing item');
+  assert.equal(purchase.renameVendor(book,{tab:'Thorlabs',id:456,name:'Optics Supplier',code:'OPS'}),
+    'Vendor updated to Optics Supplier (OPS).');
+  assert(!purchase.vendorNames(book).includes('Thorlabs'));
+  assert(purchase.vendorNames(book).includes('Optics Supplier'));
+  assert.equal(vendor.getRange('D4').getDisplayValue(),'Existing item');
+  assert.match(vendor.getRange('A4').getFormula(), /"OPS"/);
+  assert.match(tabs.get('Others').getRange('A4').getFormula(), /'Optics Supplier'!/);
+  assert.throws(()=>purchase.removableVendor(book,'Optics Supplier'), /custom vendor tab/);
+  const amazon=tabs.get('Amazon');
+  const renameAmazon=amazon.setName;
+  amazon.getSheetId=()=>789;
+  amazon.setName=value=>{
+    tabs.delete(amazon.getName());
+    renameAmazon.call(amazon,value);
+    tabs.set(value,amazon);
+  };
+  amazon.getRange('A1').setValue('000123');
+  assert.equal(purchase.renameVendor(book,{tab:'Amazon',id:789,name:'Alternate Store',code:'ALT'}),
+    'Vendor updated to Alternate Store (ALT).');
+  assert.equal(tabs.get('Control').getRange('B5').getDisplayValue(),'000123');
+  assert.equal(amazon.getRange('A1').getFormula(),purchase.grantFormula);
+  assert.equal(purchase.removeVendor(book,{tab:'Alternate Store',id:789,confirmation:'DELETE_TAB'}),'Removed Alternate Store.');
+  assert(!purchase.vendorNames(book).includes('Amazon'));
+  assert(!tabs.has('Alternate Store'));
+  assert.equal(tabs.get('Mouser').getRange('A1').getFormula(),purchase.grantFormula);
+  assert.equal(tabs.get('Control').getRange('B5').getDisplayValue(),'000123');
+  assert.doesNotThrow(()=>purchase.ids(book));
 });
 
 test('Starter tab cleanup preserves notes, content, and the last tab', () => {

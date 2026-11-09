@@ -9,8 +9,11 @@ const PA = {
     ordered:'Enter the actual order date once. Blank dates leave the Item number blank.',
     month:'Choose an accounting date. The summary uses its month and year. Leave blank until assigned.'
   },
-  grantFormula:'=IF(Amazon!$A$1="","",Amazon!$A$1)',
+  grantFormula:'=IF(Control!$B$5="","",Control!$B$5)',
   vendors:['Amazon','Molex','Top3DShop','Edmund Optics','Thorlabs','MacMaster','DigiKey','Mouser','Others','Shipment'],
+  vendorCodeKey:'PurchaseToolsVendorCode',
+  vendorOriginKey:'PurchaseToolsVendorOrigin',
+  removedAmazonKey:'PurchaseToolsAmazonRemoved',
   codes:{Amazon:'AMZ',Molex:'MOX',Top3DShop:'T3D','Edmund Optics':'EDM',Thorlabs:'THR',MacMaster:'MCM',DigiKey:'DIG',Mouser:'MOU','Fiber Optic Center':'FOC',FedEx:'FDX',UPS:'UPS',USPS:'USPS',DHL:'DHL'},
   text(v){return String(v??'').replace(/\u00a0/g,' ').trim();},
   number(v){return v==null||this.text(v)===''?NaN:Number(typeof v==='number'?v:this.text(v).replace(/[$,\s]/g,''));},
@@ -42,6 +45,31 @@ const PA = {
   rows(sh){
     const l=this.layout(sh),n=Math.max(0,sh.getLastRow()-l.first+1);
     return {l,rows:n?sh.getRange(l.first,1,n,l.width).getValues():[]};
+  },
+  vendorMetadata(sh,key){
+    return sh.getDeveloperMetadata().find(entry=>entry.getKey()===key);
+  },
+  customVendorCode(sh){
+    return this.vendorMetadata(sh,this.vendorCodeKey)?.getValue()||'';
+  },
+  isVendor(sh){
+    return Boolean(sh&&(this.vendors.includes(sh.getName())||this.customVendorCode(sh)));
+  },
+  vendorNames(book){
+    const aliases=new Map(),custom=[];
+    for(const sh of book.getSheets()){
+      const name=sh.getName();
+      if(this.vendors.includes(name)||['Control','Projects'].includes(name)||!this.customVendorCode(sh))continue;
+      const origin=this.vendorMetadata(sh,this.vendorOriginKey)?.getValue();
+      if(!origin){custom.push(name);continue;}
+      const original=book.getSheetByName(origin);
+      if(aliases.has(origin)||(original&&original.getName()!==name))
+        throw Error('Multiple tabs claim the built-in vendor '+origin+'.');
+      aliases.set(origin,name);
+    }
+    const control=book.getSheetByName('Control');
+    const removed=control&&this.vendorMetadata(control,this.removedAmazonKey);
+    return [...this.vendors.filter(name=>name!=='Amazon'||!removed).map(name=>aliases.get(name)||name),...custom];
   },
   code(company){
     const key=this.text(company).toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -99,12 +127,7 @@ const PA = {
     for(const name of this.vendors){
       if(book.getSheetByName(name)||requested&&!requested.includes(name))continue;
       created.push(name);
-      const sh=book.insertSheet(name),row=name==='Shipment'?4:3,fields=headers(name);
-      if(name==='Amazon')sh.getRange('A1').setNumberFormat('@').setNote('Enter the grant number here. Other vendor tabs use this grant.');
-      else sh.getRange('A1').setFormula(this.grantFormula);
-      sh.getRange(row,1,1,fields.length).setValues([fields]);
-      const l=this.layout(sh),n=sh.getMaxRows()-row;
-      for(const column of [l.priority,l.paid,l.arrived])sh.getRange(row+1,column,n,1).insertCheckboxes();
+      this.createVendorSheet(book.insertSheet(name),headers(name));
     }
     for(const name of requested?created:this.vendors){
       const sh=book.getSheetByName(name),l=this.layout(sh);
@@ -124,6 +147,201 @@ const PA = {
       sh.getRange(2,3,sh.getMaxRows()-1,1).insertCheckboxes();
       sh.setFrozenRows(1);sh.setColumnWidth(2,380);sh.setColumnWidth(4,300);
     }
+  },
+  createVendorSheet(sh,fields){
+    const name=sh.getName(),row=name==='Shipment'?4:3;
+    sh.getRange('A1').setFormula(this.grantFormula).setNote('Shared grant number from Control!B5.');
+    sh.getRange(row,1,1,fields.length).setValues([fields]);
+    const l=this.layout(sh),n=sh.getMaxRows()-row;
+    for(const column of [l.priority,l.paid,l.arrived])sh.getRange(row+1,column,n,1).insertCheckboxes();
+    return l;
+  },
+  vendorInput(book,request,current=null){
+    const name=this.text(request?.name),code=this.text(request?.code).toUpperCase();
+    if(!name||name.length>100||/^[=+@-]|[\[\]:*?\/\\]/.test(name))throw Error('Enter a valid company name for the tab.');
+    if(!/^[A-Z0-9]{2,6}$/.test(code))throw Error('Use a vendor code of 2–6 letters or digits.');
+    const sheets=book.getSheets(),normalize=value=>value.toLowerCase().replace(/[^a-z0-9]/g,'');
+    const key=normalize(name);
+    if(!key)throw Error('Include at least one letter or digit in the company name.');
+    const currentName=current?.getName(),origin=current&&(this.vendorMetadata(current,this.vendorOriginKey)?.getValue()||currentName);
+    if([...this.vendors,'Control','Projects',...Object.keys(this.codes)].some(existing=>existing!==origin&&normalize(existing)===key)||
+        sheets.some(sh=>sh.getName()!==currentName&&normalize(sh.getName())===key))
+      throw Error('A tab with that name already exists or is reserved.');
+    if(Object.entries(this.codes).some(([vendor,reserved])=>vendor!==origin&&reserved===code)||
+        sheets.some(sh=>sh.getName()!==currentName&&this.customVendorCode(sh)===code))
+      throw Error('That vendor code is already in use. Choose another.');
+    return {name,code};
+  },
+  addVendor(book,request){
+    this.project(book);
+    const {name,code}=this.vendorInput(book,request);
+    const sh=book.insertSheet(name);
+    try{
+      const l=this.createVendorSheet(sh,['Item number','Ordered on','Priority','Item','Link','Quantity','Individual price',
+        'Final price','Arrive_lab','Category','Reported on','Paid','Arrived','Notes']);
+      const n=sh.getMaxRows()-l.first+1;
+      sh.getRange(l.first,l.category,n,1).setDataValidation(this.categoryRule());
+      for(const [column,field] of [[l.ordered,'ordered'],[l.month,'month']])
+        sh.getRange(l.first,column,n,1).setNumberFormat('yyyy-mm-dd').setDataValidation(this.dateRule(field));
+      sh.getRange(l.first,l.arrival,n,1).setNumberFormat('yyyy-mm-dd');
+      this.restoreFinalPrice(sh,l);
+      this.prepareTracking(sh,l);
+      this.styleVendor(sh);
+      this.statusFormat(sh);
+      sh.setColumnWidth(l.priority,95);
+      sh.addDeveloperMetadata(this.vendorCodeKey,code);
+      this.ids(book,false,{sh,l,first:l.first,last:sh.getMaxRows()});
+      return 'Created '+name+' ('+code+').';
+    }catch(error){book.deleteSheet(sh);throw error;}
+  },
+  renameableVendor(book,tab){
+    const sh=book.getSheetByName(tab);
+    if(!this.isVendor(sh)||['Others','Shipment','Control','Projects'].includes(tab))
+      throw Error('Open a regular vendor tab. Others and Shipment have special roles and keep their names.');
+    return sh;
+  },
+  renameVendor(book,request){
+    const sh=this.renameableVendor(book,request?.tab),oldName=sh.getName();
+    if(sh.getSheetId()!==request.id)throw Error('This tab changed. Reopen Rename vendor tab.');
+    const {name,code}=this.vendorInput(book,request,sh);
+    const codeEntry=this.vendorMetadata(sh,this.vendorCodeKey),oldCode=codeEntry?.getValue();
+    if(name===oldName&&code===(oldCode||this.code(oldName)))return 'Vendor tab is already up to date.';
+    const originEntry=this.vendorMetadata(sh,this.vendorOriginKey);
+    const builtIn=this.vendors.includes(oldName)&&!originEntry;
+    if((originEntry?.getValue()||oldName)==='Amazon')this.repairGrantLinks(book,this.vendorNames(book));
+    const rewrite=()=>{
+      const l=this.layout(sh);
+      this.ids(book,false,{sh,l,first:l.first,last:sh.getMaxRows()});
+      this.ids(book,false,null,null,'');
+    };
+    try{
+      if(codeEntry)codeEntry.setValue(code);
+      else sh.addDeveloperMetadata(this.vendorCodeKey,code);
+      if(builtIn)sh.addDeveloperMetadata(this.vendorOriginKey,oldName);
+      if(name!==oldName)sh.setName(name);
+      sh.getRange('A2').setValue(name.toUpperCase());
+      rewrite();
+    }catch(error){
+      try{
+        if(sh.getName()!==oldName)sh.setName(oldName);
+        if(codeEntry)codeEntry.setValue(oldCode);
+        else this.vendorMetadata(sh,this.vendorCodeKey)?.remove();
+        if(builtIn)this.vendorMetadata(sh,this.vendorOriginKey)?.remove();
+        sh.getRange('A2').setValue(oldName.toUpperCase());
+        rewrite();
+      }catch(repairError){throw Error(error.message+' Rename rollback needs review: '+repairError.message);}
+      throw error;
+    }
+    return 'Vendor updated to '+name+' ('+code+').';
+  },
+  vendorPicker(rename=false){
+    const title=rename?'Rename vendor tab':'Add vendor tab';
+    const book=rename?SpreadsheetApp.getActiveSpreadsheet():null;
+    const sh=book?this.renameableVendor(book,book.getActiveSheet().getName()):null;
+    const target=sh?{tab:sh.getName(),id:sh.getSheetId(),code:this.customVendorCode(sh)||this.code(sh.getName())}:null;
+    const html=`<!doctype html><html><head><base target="_top"><style>
+      body{font:14px Arial,sans-serif;padding:16px;color:#202124}
+      label{display:block;margin:0 0 14px;font-weight:bold}
+      input{display:block;box-sizing:border-box;width:100%;padding:8px;margin-top:5px;font:inherit}
+      button{padding:8px 14px;margin-right:6px}#status{white-space:pre-wrap}
+    </style></head><body><form id="vendor">
+      <label>Company name<input name="company" required maxlength="100" autofocus></label>
+      <label>Vendor code<input name="code" required pattern="[A-Za-z0-9]{2,6}" maxlength="6" placeholder="2–6 letters or digits"></label>
+      <p id="hint" hidden>Future orders and summaries use the new company name. Changing the code changes existing Item numbers. Previously generated files stay as saved.</p>
+      <button type="submit">Create vendor tab</button>
+      <button type="button" id="close">Cancel</button>
+    </form><p id="status" role="status" aria-live="polite"></p>
+    <script>
+      const form=document.getElementById('vendor'),status=document.getElementById('status');
+      const close=document.getElementById('close'),submit=form.querySelector('[type=submit]');
+      const target=__TARGET__;
+      if(target){
+        form.elements.company.value=target.tab;form.elements.code.value=target.code;
+        submit.textContent='Save vendor';document.getElementById('hint').hidden=false;
+      }
+      close.onclick=()=>google.script.host.close();
+      form.onsubmit=event=>{
+        event.preventDefault();
+        if(submit.disabled)return;
+        submit.disabled=close.disabled=true;status.textContent=target?'Updating vendor tab…':'Creating vendor tab…';
+        const runner=google.script.run.withSuccessHandler(message=>{
+          status.textContent=message;submit.hidden=true;close.textContent='Close';close.disabled=false;
+        }).withFailureHandler(error=>{
+          status.textContent=error.message;submit.disabled=close.disabled=false;
+        });
+        const fields={name:form.elements.company.value,code:form.elements.code.value};
+        if(target)runner.renamePurchaseVendor({...target,...fields});
+        else runner.addPurchaseVendor(fields);
+      };
+    </script></body></html>`;
+    const payload=JSON.stringify(target).replace(/</g,'\\u003c');
+    SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html.replace('__TARGET__',()=>payload))
+      .setWidth(420).setHeight(rename?410:310),title);
+  },
+  removableVendor(book,tab){
+    const sheet=book.getSheetByName(tab);
+    if(sheet&&(tab==='Amazon'||this.vendorMetadata(sheet,this.vendorOriginKey)?.getValue()==='Amazon'))return sheet;
+    if(!sheet||[...this.vendors,'Control','Projects'].includes(sheet.getName())||
+        !this.customVendorCode(sheet)||this.vendorMetadata(sheet,this.vendorOriginKey))
+      throw Error('Open Amazon or a custom vendor tab created with Add vendor tab.');
+    return sheet;
+  },
+  removeVendor(book,request){
+    if(request?.confirmation!=='DELETE_TAB')throw Error('Type DELETE_TAB exactly to remove the vendor tab.');
+    const sheet=this.removableVendor(book,request.tab);
+    if(sheet.getSheetId()!==request.id)throw Error('This tab changed. Reopen Remove vendor tab.');
+    const name=sheet.getName();
+    const amazon=(this.vendorMetadata(sheet,this.vendorOriginKey)?.getValue()||name)==='Amazon';
+    const control=book.getSheetByName('Control');
+    if(amazon)this.repairGrantLinks(book,this.vendorNames(book));
+    try{
+      this.ids(book,false,null,null,name);
+      if(amazon)control.addDeveloperMetadata(this.removedAmazonKey,'true');
+      book.deleteSheet(sheet);
+    }catch(error){
+      if(book.getSheetByName(name)?.getSheetId()===request.id){
+        if(amazon)this.vendorMetadata(control,this.removedAmazonKey)?.remove();
+        try{this.ids(book,false,null,null,'');}
+        catch(repairError){throw Error(error.message+' Item number formulas could not be restored. Run Refresh / repair item IDs.');}
+      }
+      throw error;
+    }
+    return 'Removed '+name+'.';
+  },
+  removeVendorPicker(){
+    const book=SpreadsheetApp.getActiveSpreadsheet(),sheet=this.removableVendor(book,book.getActiveSheet().getName());
+    const target=JSON.stringify({tab:sheet.getName(),id:sheet.getSheetId()}).replace(/</g,'\\u003c');
+    const html=`<!doctype html><html><head><base target="_top"><style>
+      body{font:14px Arial,sans-serif;padding:16px;color:#202124}
+      input{box-sizing:border-box;width:100%;padding:8px;margin:8px 0 14px;font:inherit}
+      button{padding:8px 14px;margin-right:6px}#remove{color:#b3261e}
+    </style></head><body><form id="removal">
+      <p>Remove <strong id="tab"></strong>?</p>
+      <p><strong>This is irreversible. Purchase Tools cannot recover the tab or its data.</strong></p>
+      <p>Saved orders and reports stay in Drive. Future and regenerated summaries omit this tab's purchases. Any custom formulas that reference this tab may break.</p>
+      <label>Type <strong>DELETE_TAB</strong> to confirm<input id="confirmation" required autocomplete="off"></label>
+      <button type="submit" id="remove" disabled>Delete tab</button>
+      <button type="button" id="close">Cancel</button>
+    </form><p id="status" role="status" aria-live="polite"></p>
+    <script>
+      const target=__TARGET__;
+      const byId=id=>document.getElementById(id);
+      const input=byId('confirmation'),remove=byId('remove'),close=byId('close'),status=byId('status');
+      byId('tab').textContent=target.tab;
+      input.oninput=()=>{remove.disabled=input.value!=='DELETE_TAB';};
+      close.onclick=()=>google.script.host.close();
+      byId('removal').onsubmit=event=>{
+        event.preventDefault();
+        if(remove.disabled||input.value!=='DELETE_TAB')return;
+        remove.disabled=close.disabled=input.disabled=true;status.textContent='Removing vendor tab…';
+        google.script.run.withSuccessHandler(message=>{
+          status.textContent=message;remove.hidden=true;close.textContent='Close';close.disabled=false;
+        }).withFailureHandler(error=>{
+          status.textContent=error.message;remove.disabled=close.disabled=input.disabled=false;
+        }).removePurchaseVendor({...target,confirmation:input.value});
+      };
+    </script></body></html>`;
+    SpreadsheetApp.getUi().showModalDialog(HtmlService.createHtmlOutput(html.replace('__TARGET__',()=>target)).setWidth(450).setHeight(370),'Remove vendor tab');
   },
   dateRule(field){
     return SpreadsheetApp.newDataValidation().requireDate().setAllowInvalid(false).setHelpText(this.dateHelp[field]).build();
@@ -173,11 +391,12 @@ const PA = {
     sh.getRange('A2').setValue('Use Purchase Tools to set up this workbook, create orders, and generate reports.');
     sh.getRange('A2:B26').setWrap(true).setVerticalAlignment('middle');
     sh.getRange('A3:A26').setBackground('#eff2f7').setFontWeight('bold');
-    sh.getRange('B3:B4').setBackground('#c1eac9').setNumberFormat('@').setFontSize(12).setFontWeight('bold');
+    sh.getRange('A5').setValue('Grant number');
+    sh.getRange('B3:B5').setBackground('#c1eac9').setNumberFormat('@').setFontSize(12).setFontWeight('bold');
     for(const [row,label,description] of [
       [6,'Monthly summary','Choose a month and year in Purchase Tools. The report includes enabled projects.'],
       [7,'Other projects','Use Sync projects in this folder to manage the Projects list.'],
-      [9,'Grant','Set the grant in Amazon!A1 or in the setup window. Other vendor tabs read it from Amazon.'],
+      [9,'Grant','Set the grant in Control!B5 or in the setup window. All vendor tabs read it from Control.'],
       [10,'Paid / Arrived','Checking both boxes turns the row green. Arrived saves a date. Unchecking it clears the date.'],
       [11,'Received Log','Setup enables logging for individual Paid, Arrived, and Notes edits.'],
       [18,'Order selection','Open a vendor tab and enter item numbers, ranges, or ALL in the order dialog.'],
@@ -213,12 +432,39 @@ const PA = {
   },
   setupSettings(book){
     return [
-      ['Amazon','A1','Grant number'],
+      ['Control','B5','Grant number'],
       ['Control','B3','Project name'],
       ['Control','B4','Project code']
     ].map(([tab,cell,label])=>({
       tab,cell,label,current:book.getSheetByName(tab)?.getRange(cell).getDisplayValue()||''
     }));
+  },
+  repairGrantLinks(book,vendors,changes=[]){
+    const control=book.getSheetByName('Control');
+    if(!control)throw Error('Restore the Control tab before updating grant links.');
+    const target=control.getRange('B5'),legacy=book.getSheetByName('Amazon')?.getRange('A1');
+    if(!this.text(target.getDisplayValue())&&legacy&&legacy.getFormula()!==this.grantFormula){
+      const value=this.text(legacy.getDisplayValue());
+      if(value.startsWith('#')||value.startsWith('='))throw Error('Correct the legacy grant in Amazon!A1 or enter it in Control!B5.');
+      if(value){
+        target.setNumberFormat('@').setValue(value);
+        changes.push('Moved the shared grant to Control!B5.');
+      }
+    }
+    const label=control.getRange('A5');
+    if(label.getDisplayValue()!=='Grant number'){
+      label.setValue('Grant number');
+      target.setBackground('#c1eac9').setNumberFormat('@').setFontSize(12).setFontWeight('bold');
+      control.getRange('B9').setValue('Set the grant in Control!B5 or in the setup window. All vendor tabs read it from Control.');
+      changes.push('Added the shared grant field to Control.');
+    }
+    for(const name of vendors){
+      const grant=book.getSheetByName(name)?.getRange('A1');
+      if(grant&&grant.getFormula()!==this.grantFormula){
+        grant.setFormula(this.grantFormula).setNote('Shared grant number from Control!B5.');
+        changes.push(name+': restored grant link.');
+      }
+    }
   },
   progressPicker(title,working,handler,measured=false){
     const session=measured?Utilities.getUuid():'';
@@ -423,11 +669,7 @@ const PA = {
         book.getSheetByName(setting.tab).getRange(setting.cell).setNumberFormat('@').setValue(values[i]);
       }
     });
-    for(const name of this.vendors){
-      if(name==='Amazon')continue;
-      const grant=book.getSheetByName(name).getRange('A1');
-      if(grant.getFormula()!==this.grantFormula)grant.setFormula(this.grantFormula);
-    }
+    this.repairGrantLinks(book,this.vendors);
     const repaired=this.ids(book);
     try{
       if(!templateOnly)this.enableReceivedLog(book);
@@ -454,7 +696,7 @@ const PA = {
       '',
       'BEFORE GENERATING ORDERS OR SUMMARIES',
       'Check the project name/code in Control!B3/B4',
-      'and the grant in Amazon!A1.',
+      'and the grant in Control!B5.',
       '',
       'Paid + Arrived turns the row green. Arrived stamps a fixed date; unchecking clears it.',
       'Use the Purchase Tools prompt to select items for an order.',
@@ -473,8 +715,9 @@ const PA = {
   },
   checkWorkbook(book,progress=()=>{}){
     const changes=[],notices=[],missing=[],layouts=new Map();
-    const managedTabs=[...this.vendors,'Control','Projects'];
-    const total=this.vendors.length+3;
+    const vendors=this.vendorNames(book);
+    const managedTabs=[...vendors,'Control','Projects'];
+    const total=vendors.length+3;
     let completed=0;
     progress(completed,total,'Checking workbook structure');
     if(managedTabs.every(name=>!book.getSheetByName(name)))
@@ -486,12 +729,13 @@ const PA = {
     for(const name of managedTabs){
       if(!book.getSheetByName(name))missing.push(name);
     }
+    if(!missing.includes('Control'))this.repairGrantLinks(book,vendors,changes);
     for(const setting of this.setupSettings(book)){
       if(!missing.includes(setting.tab)&&!this.text(setting.current))
         notices.push(setting.label+' is blank in '+setting.tab+'!'+setting.cell+'.');
     }
     completed++;
-    for(const name of this.vendors){
+    for(const name of vendors){
       progress(completed++,total,'Checking '+name);
       const sh=book.getSheetByName(name);
       if(!sh)continue;
@@ -517,13 +761,6 @@ const PA = {
         this.fillTracking(sh,l,l.first,last,true);
         changes.push(name+': assigned missing Purchase Record IDs.');
       }
-      if(name!=='Amazon'&&!missing.includes('Amazon')){
-        const grant=sh.getRange('A1');
-        if(grant.getFormula()!==this.grantFormula){
-          grant.setFormula(this.grantFormula);
-          changes.push(name+': restored grant link.');
-        }
-      }
       this.checkFinalPrice(sh,l,last,values,changes,notices);
       this.checkVendorStyle(sh,l,activeRows,changes);
     }
@@ -532,7 +769,7 @@ const PA = {
     else{
       const repaired=this.ids(book,false,null,layouts);
       if(repaired)changes.push('Repaired '+repaired+' Item number formula(s).');
-      if(layouts.size!==this.vendors.length)notices.push('Company-based Item number checks need all vendor tabs.');
+      if(layouts.size!==vendors.length)notices.push('Company-based Item number checks need all vendor tabs.');
     }
     progress(completed,total,'Checking Drive links and Received Log');
     let assets;
@@ -540,12 +777,12 @@ const PA = {
     catch(error){notices.push('Drive assets: '+error.message);}
     const control=book.getSheetByName('Control');
     if(control){
-      if(control.getRange('A1').getDisplayValue()!=='PURCHASE WORKFLOW'){
+      if(control.getRange('A1').getDisplayValue()!=='PURCHASE WORKFLOW'||control.getRange('A5').getDisplayValue()!=='Grant number'){
         this.formatControl(control,assets);
         changes.push('Restored Control layout.');
       }else if(assets&&this.controlLinks(control,assets,true))changes.push('Refreshed Control links.');
     }
-    if(layouts.has('Amazon')){
+    if(layouts.size){
       try{if(this.enableReceivedLog(book))changes.push('Enabled Received Log.');}
       catch(error){notices.push('Received Log: '+error.message);}
     }
@@ -624,7 +861,8 @@ const PA = {
     }
   },
   recreateMissing(book,requested,progress=()=>{}){
-    const missing=requested.filter(name=>!book.getSheetByName(name));
+    const managed=new Set([...this.vendorNames(book),'Control','Projects']);
+    const missing=requested.filter(name=>managed.has(name)&&!book.getSheetByName(name));
     if(!missing.length)return 'The requested tabs are already present.';
     progress(0,this.vendors.length+3,'Recreating missing tabs');
     this.format(book,missing);
@@ -695,7 +933,7 @@ const PA = {
   trackingEdit(e){
     if(!e?.range)return;
     const sh=e.range.getSheet();
-    if(!this.vendors.includes(sh.getName()))return;
+    if(!this.isVendor(sh))return;
     const l=this.layout(sh),first=Math.max(l.first,e.range.getRow()),last=e.range.getLastRow();
     if(last<first)return;
     const lock=LockService.getDocumentLock();
@@ -733,7 +971,12 @@ const PA = {
     return sh;
   },
   enableReceivedLog(book){
-    if(!this.layout(book.getSheetByName('Amazon')).tracking)throw Error('Initialize or repair the workbook before enabling Received Log.');
+    const ready=this.vendorNames(book).some(name=>{
+      const sh=book.getSheetByName(name);
+      if(!sh)return false;
+      try{return Boolean(this.layout(sh).tracking);}catch(error){return false;}
+    });
+    if(!ready)throw Error('Initialize or repair the workbook before enabling Received Log.');
     const settings=PropertiesService.getScriptProperties(),key='RECEIVED_LOG_TRIGGER_ID',saved=settings.getProperty(key);
     const triggers=ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction()==='trackPurchaseLog');
     const current=triggers.find(t=>t.getEventType()===ScriptApp.EventType.ON_EDIT&&t.getTriggerSourceId()===book.getId()&&t.getUniqueId()===saved);
@@ -751,7 +994,7 @@ const PA = {
   recordReceivedEdit(e){
     if(!e?.range||e.range.getNumRows()!==1||e.range.getNumColumns()!==1)return;
     const sh=e.range.getSheet(),name=sh.getName();
-    if(!this.vendors.includes(name))return;
+    if(!this.isVendor(sh))return;
     const l=this.layout(sh),row=e.range.getRow(),col=e.range.getColumn();
     if(row<l.first||!l.tracking||![l.paid,l.arrived,l.notes].includes(col))return;
     const purchase=sh.getRange(row,1,1,l.width);
@@ -777,7 +1020,7 @@ const PA = {
   },
   receiptEdit(e){
     if(!e||!e.range||!e.source)return;
-    const sh=e.range.getSheet();if(!this.vendors.includes(sh.getName()))return;
+    const sh=e.range.getSheet();if(!this.isVendor(sh))return;
     const l=this.layout(sh),first=Math.max(l.first,e.range.getRow()),last=e.range.getLastRow();
     if(first>last||l.arrived<e.range.getColumn()||l.arrived>e.range.getLastColumn())return;
     const lock=LockService.getDocumentLock();if(!lock)return;
@@ -804,9 +1047,9 @@ const PA = {
     }catch(error){e.source.toast('Arrival date not updated: '+error.message,'Purchase Tools',10);throw error;}
     finally{lock.releaseLock();}
   },
-  ids(book,refresh=false,edited=null,checked=null){
+  ids(book,refresh=false,edited=null,checked=null,excludedVendor=null){
     // One row formula per available row. No fixed suffix or stored counters.
-    const names=edited&&!edited.l.company?[edited.sh.getName()]:this.vendors;
+    const names=edited&&!edited.l.company?[edited.sh.getName()]:this.vendorNames(book).filter(name=>name!==excludedVendor);
     const layouts=checked||new Map(names.map(name=>{
       if(edited?.sh.getName()===name)return [name,edited];
       const sh=book.getSheetByName(name);if(!sh)throw Error('Missing '+name+' tab. Run setup first.');
@@ -814,17 +1057,27 @@ const PA = {
     }));
     const letter=n=>{let s='';for(;n;n=Math.floor((n-1)/26))s=String.fromCharCode(65+(n-1)%26)+s;return s;};
     const quote=name=>"'"+name.replace(/'/g,"''")+"'";
+    const vendorCodes=new Map(),used=new Set();
+    for(const [name,{sh,l}] of layouts){
+      if(l.company)continue;
+      const code=this.customVendorCode(sh)||(this.vendors.includes(name)?this.code(name):'');
+      if(!/^[A-Z0-9]{2,6}$/.test(code)||used.has(code))throw Error('Invalid or duplicate vendor code on '+name+'.');
+      vendorCodes.set(name,code);used.add(code);
+    }
     const companyCode=ref=>{
       const key='LOWER(REGEXREPLACE(LOWER(TRIM(TO_TEXT('+ref+'))),"[^a-z0-9]",""))';
-      const choices=Object.entries(this.codes).map(([name,code])=>'"'+name.toLowerCase().replace(/[^a-z0-9]/g,'')+'","'+code+'"').join(',');
+      const choices=Object.entries({...this.codes,...Object.fromEntries(vendorCodes)})
+        .filter(([name])=>/[a-z0-9]/i.test(name))
+        .map(([name,code])=>'"'+name.toLowerCase().replace(/[^a-z0-9]/g,'')+'","'+code+'"').join(',');
       return 'IF('+key+'="","",SWITCH('+key+','+choices+',UPPER(LEFT('+key+',6))))';
     };
     const present=ref=>'N(LEN(TRIM(TO_TEXT('+ref+')))>0)';
     let repaired=0;
     for(const [name,{sh,l,activeRows,last:checkedLast}] of layouts){
-      if(edited&&name!==edited.sh.getName()||checked&&l.company&&layouts.size!==this.vendors.length)continue;
+      if(excludedVendor!==null&&!l.company)continue;
+      if(edited&&name!==edited.sh.getName()||checked&&l.company&&layouts.size!==names.length)continue;
       const item=letter(l.item),currentItem='INDEX('+item+':'+item+',ROW())',ordered='INDEX('+letter(l.ordered)+':'+letter(l.ordered)+',ROW())';
-      const code=l.company?companyCode('INDEX('+letter(l.company)+':'+letter(l.company)+',ROW())'):'"'+this.code(name)+'"';
+      const code=l.company?companyCode('INDEX('+letter(l.company)+':'+letter(l.company)+',ROW())'):'"'+vendorCodes.get(name)+'"';
       let sequence='SUMPRODUCT(ARRAYFORMULA('+present('INDEX('+item+':'+item+','+l.first+'):INDEX('+item+':'+item+',ROW())')+'))';
       if(l.company){
         const count=(tab,running)=>{
@@ -834,7 +1087,7 @@ const PA = {
         };
         const prior=[...layouts].filter(([tab,{l:x}])=>!x.company).map(([tab,{l:x}])=>{
           const col=quote(tab)+'!'+letter(x.item)+':'+letter(x.item);
-          return 'IF(vcode="'+this.code(tab)+'",SUMPRODUCT(ARRAYFORMULA('+present('INDEX('+col+','+x.first+'):INDEX('+col+',ROWS('+col+'))')+')),0)';
+          return 'IF(vcode="'+vendorCodes.get(tab)+'",SUMPRODUCT(ARRAYFORMULA('+present('INDEX('+col+','+x.first+'):INDEX('+col+',ROWS('+col+'))')+')),0)';
         });
         if(name==='Shipment')prior.push(count('Others',false));
         sequence=[...prior,count(name,true)].join('+');
@@ -868,7 +1121,7 @@ const PA = {
     this.project(book); // Explain missing project settings before rewriting tags.
     const changed=this.ids(book,true),missing=[];
     // Reading after flush checks the displayed result of the rewritten formulas.
-    for(const name of this.vendors){
+    for(const name of this.vendorNames(book)){
       const sh=book.getSheetByName(name),{l,rows}=this.rows(sh);
       rows.forEach((r,i)=>{
         if(this.text(r[l.item-1])&&!/^[A-Z0-9]+-\d{8}-[A-Z0-9]{2,10}-\d{4}$/.test(this.text(r[0])))
@@ -894,7 +1147,7 @@ const PA = {
   },
   records(book,project=this.project(book)){
     const tz=book.getSpreadsheetTimeZone(),out=[];
-    for(const tab of this.vendors){
+    for(const tab of this.vendorNames(book)){
       const sh=book.getSheetByName(tab);if(!sh)continue;const {l,rows}=this.rows(sh);
       const grant=this.text(sh.getRange('A1').getDisplayValue());
       const grantMissing=!grant||/^#(?:REF!|N\/A|VALUE!|ERROR!|NAME\?|NUM!|DIV\/0!|NULL!)$/.test(grant);
@@ -959,7 +1212,7 @@ const PA = {
     }return [...result.values()].sort((a,b)=>a.row-b.row);
   },
   orders(book,selection,tab=book.getActiveSheet().getName(),inline=false){
-    if(!this.vendors.includes(tab)||!book.getSheetByName(tab))throw Error('Open a vendor tab first.');
+    if(!this.isVendor(book.getSheetByName(tab)))throw Error('Open a vendor tab first.');
     const input=this.text(selection);
     if(!input)throw Error('Enter current IDs, ranges, or ALL in the order prompt.');
     this.ids(book);
@@ -1011,8 +1264,8 @@ const PA = {
     return urls;
   },
   orderPicker(){
-    const tab=SpreadsheetApp.getActiveSpreadsheet().getActiveSheet().getName();
-    if(!this.vendors.includes(tab))throw Error('Open a vendor tab first.');
+    const sheet=SpreadsheetApp.getActiveSpreadsheet().getActiveSheet(),tab=sheet.getName();
+    if(!this.isVendor(sheet))throw Error('Open a vendor tab first.');
     const html=`<!doctype html><html><head><style>
   body{font:14px Arial,sans-serif;color:#202124;margin:0;padding:22px}
   label{display:block;font-weight:bold;margin-bottom:7px}
@@ -1735,9 +1988,28 @@ function onOpen() {
     )
     .addItem('Sync projects in this folder','syncPurchaseProjects')
     .addSeparator()
+    .addItem('Add vendor tab','addPurchaseVendor')
+    .addItem('Remove vendor tab','removePurchaseVendor')
+    .addItem('Rename vendor tab','renamePurchaseVendor')
+    .addSeparator()
     .addSeparator()
     .addItem('Initialize Drive templates and folders','initializePurchaseDrive')
     .addToUi();
+}
+
+function addPurchaseVendor(request) {
+  if(request===undefined)return PA.vendorPicker();
+  return PA.run('addVendor',request);
+}
+
+function removePurchaseVendor(request) {
+  if(request===undefined)return PA.removeVendorPicker();
+  return PA.run('removeVendor',request);
+}
+
+function renamePurchaseVendor(request) {
+  if(request===undefined)return PA.vendorPicker(true);
+  return PA.run('renameVendor',request);
 }
 
 function setupPurchaseWorkbook(request) {
