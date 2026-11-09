@@ -14,6 +14,49 @@ function app(services) {
   return vm.runInNewContext(script + '\nPA', services);
 }
 
+test('single-workbook sync removes absent entries and keeps unreadable files listed in the folder', () => {
+  const validation={requireCheckbox:()=>validation,build:()=>({})};
+  const purchase=app({
+    SpreadsheetApp:{newDataValidation:()=>validation,flush(){},openById(){throw Error('No access');}}
+  });
+  const sh=sheet('Projects'),range=sh.getRange;
+  sh.getRange=(...args)=>{
+    const r=range(...args);
+    return Object.assign(r,{getNotes:()=>r.getValues().map(row=>row.map(()=>'')),
+      getValue:()=>r.getValues()[0][0],getFontWeight:()=> 'bold',canEdit:()=>true,clearNote:()=>r});
+  };
+  const current={id:'current_project_123456',name:'Current',code:'CUR',fileName:'Current',current:true};
+  sh.getRange('A1:D4').setValues([
+    ['Project','Spreadsheet URL or ID','Enabled','Notes'],
+    [current.code,current.id,true,''],
+    ['OLD','missing_project_123456',true,''],
+    ['UNKNOWN','unknown_project_123456',true,'keep']
+  ]);
+  purchase.scanProjects=()=>({folderId:'folder',projects:[current],folderIds:[current.id,'unknown_project_123456']});
+  const [result]=purchase.syncProjectRegistries({getSheetByName:()=>sh},{folderId:'folder',projects:[current]});
+  assert.match(result.status,/Removed 1 workbook entry outside the folder/);
+  assert.match(result.status,/Could not verify Projects rows 4/);
+  assert.deepEqual(sh.getRange('A3:D3').getValues()[0],['','','','']);
+  assert.equal(sh.getRange('D4').getValue(),'keep');
+});
+
+test('initialization status remains available without the original dialog', () => {
+  const states=new Map(),notices=[];
+  const purchase=app({CacheService:{getDocumentCache:()=>({get:key=>states.get(key),put:(key,value)=>states.set(key,value)})}});
+  const book={getId:()=> 'demo',toast:message=>notices.push(message)};
+  purchase.setup=()=>{
+    assert.equal(purchase.setupRunStatus(book).state,'running');
+    return 'Setup complete with warnings';
+  };
+  purchase.initializeWithStatus(book,{});
+  assert.equal(purchase.setupRunStatus(book).message,'Setup complete with warnings');
+  assert.match(notices[0],/finished/);
+  purchase.setup=()=>{throw Error('Setup error');};
+  assert.throws(()=>purchase.initializeWithStatus(book,{}),/Setup error/);
+  assert.equal(purchase.setupRunStatus(book).state,'failed');
+  assert.match(notices[1],/failed/);
+});
+
 test('annual reports keep other months and archive the replaced project set', () => {
   const files = [], reports = new Map();
   let nextId = 0, failWrite = false;
@@ -288,28 +331,33 @@ test('custom vendor registration creates a blank tab and uses its code in formul
   assert.equal(tabs.get('Mouser').getRange('A1').getFormula(),purchase.grantFormula);
   assert.equal(tabs.get('Control').getRange('B5').getDisplayValue(),'000123');
   assert.doesNotThrow(()=>purchase.ids(book));
+  const control=tabs.get('Control');
+  tabs.delete('DigiKey');
+  purchase.saveVendors(control,['Others','Shipment','Mouser']);
+  assert(!purchase.vendorNames(book).includes('DigiKey'));
+  tabs.delete('Mouser');
+  assert(purchase.vendorNames(book).includes('Mouser'));
+  assert.throws(()=>purchase.addVendor(book,{name:'DigiKey',code:'BAD'}), /original code DIG/);
+  assert.equal(purchase.addVendor(book,{name:'DigiKey',code:'DIG'}),'Created DigiKey (DIG).');
+  assert(purchase.expectedVendors(book).includes('DigiKey'));
+  tabs.delete('DigiKey');
+  assert(purchase.vendorNames(book).includes('DigiKey'));
+  assert.equal(purchase.addVendor(book,{name:'Amazon',code:'AMZ'}),'Created Amazon (AMZ).');
+  assert(purchase.vendorNames(book).includes('Amazon'));
 });
 
-test('Starter tab cleanup preserves notes, content, and the last tab', () => {
+test('Only an empty default starter tab without notes is eligible for reuse', () => {
   const purchase=app({});
-  let rowCount=0,notes=[['']],tabs;
-  const starter={getName:()=> 'Hoja 1',getLastRow:()=>rowCount,getMaxRows:()=>1,getMaxColumns:()=>1,
+  let rowCount=0,notes=[['']],name='Hoja 1';
+  const starter={getName:()=>name,getLastRow:()=>rowCount,getMaxRows:()=>1,getMaxColumns:()=>1,
     getRange:()=>({getNotes:()=>notes})};
-  const report={};
-  const book={getSheets:()=>tabs,deleteSheet:tab=>{tabs=tabs.filter(item=>item!==tab);}};
-  tabs=[starter];
-  purchase.removeEmptyStarter(book,starter);
-  assert.deepEqual(tabs,[starter]);
-  tabs.push(report);
+  assert.equal(purchase.isEmptyStarter(starter),true);
   notes=[['Keep this']];
-  purchase.removeEmptyStarter(book,starter);
-  assert.deepEqual(tabs,[starter,report]);
+  assert.equal(purchase.isEmptyStarter(starter),false);
   notes=[['']];rowCount=1;
-  purchase.removeEmptyStarter(book,starter);
-  assert.deepEqual(tabs,[starter,report]);
-  rowCount=0;
-  purchase.removeEmptyStarter(book,starter);
-  assert.deepEqual(tabs,[report]);
+  assert.equal(purchase.isEmptyStarter(starter),false);
+  rowCount=0;name='My notes';
+  assert.equal(purchase.isEmptyStarter(starter),false);
 });
 
 test('Progress dialog keeps warnings, confirmation, and server errors visible', () => {

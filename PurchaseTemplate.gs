@@ -1,3 +1,4 @@
+// Purchase Tools version: 1.0.6
 /** PURCHASE TEMPLATE — STAGE 1
  * One file. Receipt handling and fixed purchase record IDs.
  * IDs use the visible Ordered on date and current item order; no counters.
@@ -14,6 +15,7 @@ const PA = {
   vendorCodeKey:'PurchaseToolsVendorCode',
   vendorOriginKey:'PurchaseToolsVendorOrigin',
   removedAmazonKey:'PurchaseToolsAmazonRemoved',
+  selectedVendorsKey:'PurchaseToolsSelectedVendors',
   codes:{Amazon:'AMZ',Molex:'MOX',Top3DShop:'T3D','Edmund Optics':'EDM',Thorlabs:'THR',MacMaster:'MCM',DigiKey:'DIG',Mouser:'MOU','Fiber Optic Center':'FOC',FedEx:'FDX',UPS:'UPS',USPS:'USPS',DHL:'DHL'},
   text(v){return String(v??'').replace(/\u00a0/g,' ').trim();},
   number(v){return v==null||this.text(v)===''?NaN:Number(typeof v==='number'?v:this.text(v).replace(/[$,\s]/g,''));},
@@ -55,6 +57,20 @@ const PA = {
   isVendor(sh){
     return Boolean(sh&&(this.vendors.includes(sh.getName())||this.customVendorCode(sh)));
   },
+  requiredVendor(name){return name==='Others'||name==='Shipment';},
+  expectedVendors(book){
+    const control=book.getSheetByName('Control');
+    if(!control)return this.vendors;
+    const saved=this.vendorMetadata(control,this.selectedVendorsKey);
+    const selected=saved?JSON.parse(saved.getValue()):this.vendors;
+    const removed=this.vendorMetadata(control,this.removedAmazonKey);
+    return this.vendors.filter(name=>(this.requiredVendor(name)||selected.includes(name))&&(name!=='Amazon'||!removed));
+  },
+  saveVendors(control,names){
+    const value=JSON.stringify(names),saved=this.vendorMetadata(control,this.selectedVendorsKey);
+    if(saved)saved.setValue(value);
+    else control.addDeveloperMetadata(this.selectedVendorsKey,value);
+  },
   vendorNames(book){
     const aliases=new Map(),custom=[];
     for(const sh of book.getSheets()){
@@ -67,9 +83,7 @@ const PA = {
         throw Error('Multiple tabs claim the built-in vendor '+origin+'.');
       aliases.set(origin,name);
     }
-    const control=book.getSheetByName('Control');
-    const removed=control&&this.vendorMetadata(control,this.removedAmazonKey);
-    return [...this.vendors.filter(name=>name!=='Amazon'||!removed).map(name=>aliases.get(name)||name),...custom];
+    return [...this.expectedVendors(book).map(name=>aliases.get(name)||name),...custom];
   },
   code(company){
     const key=this.text(company).toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -105,7 +119,7 @@ const PA = {
       sh.setColumnWidth(2,145);
     }
   },
-  format(book,requested=null){
+  format(book,requested=null,starter=null){
     const headers=name=>{
       const regular=['Item','Link','Quantity','Individual price','Final price','Arrive_lab','Category','Reported on','Paid','Arrived','Notes'];
       if(name==='Shipment')return ['Item number','Ordered on','Priority','Unit','Company','Description','Date','Unit price','Final price','Order status','Reported on','Paid','Arrived','Arrive_lab','Notes','Category'];
@@ -127,7 +141,9 @@ const PA = {
     for(const name of this.vendors){
       if(book.getSheetByName(name)||requested&&!requested.includes(name))continue;
       created.push(name);
-      this.createVendorSheet(book.insertSheet(name),headers(name));
+      const sh=starter?starter.setName(name):book.insertSheet(name);
+      starter=null;
+      this.createVendorSheet(sh,headers(name));
     }
     for(const name of requested?created:this.vendors){
       const sh=book.getSheetByName(name),l=this.layout(sh);
@@ -174,7 +190,14 @@ const PA = {
   },
   addVendor(book,request){
     this.project(book);
-    const {name,code}=this.vendorInput(book,request);
+    const expected=this.expectedVendors(book);
+    const typed=this.text(request?.name),builtin=this.vendors.find(name=>!this.requiredVendor(name)&&name.toLowerCase()===typed.toLowerCase());
+    const restored=builtin&&!expected.includes(builtin);
+    const {name,code}=restored?{name:builtin,code:this.code(builtin)}:this.vendorInput(book,request);
+    if(restored&&(this.text(request?.code).toUpperCase()!==code||book.getSheets().some(sh=>
+        sh.getName().toLowerCase()===name.toLowerCase()||this.customVendorCode(sh)===code||
+        this.vendorMetadata(sh,this.vendorOriginKey)?.getValue()===name)))
+      throw Error('To add '+name+', use its original code '+code+' and a free tab name.');
     const sh=book.insertSheet(name);
     try{
       const l=this.createVendorSheet(sh,['Item number','Ordered on','Priority','Item','Link','Quantity','Individual price',
@@ -191,6 +214,11 @@ const PA = {
       sh.setColumnWidth(l.priority,95);
       sh.addDeveloperMetadata(this.vendorCodeKey,code);
       this.ids(book,false,{sh,l,first:l.first,last:sh.getMaxRows()});
+      if(restored){
+        const control=book.getSheetByName('Control');
+        this.saveVendors(control,[...expected,name]);
+        if(name==='Amazon')this.vendorMetadata(control,this.removedAmazonKey)?.remove();
+      }
       return 'Created '+name+' ('+code+').';
     }catch(error){book.deleteSheet(sh);throw error;}
   },
@@ -521,19 +549,29 @@ const PA = {
   },
   setupPicker(){
     const settings=this.setupSettings(SpreadsheetApp.getActiveSpreadsheet());
+    const vendors=this.vendors.filter(name=>!this.requiredVendor(name)).map(name=>[name,this.code(name)]);
     const html=`<!doctype html><html><head><style>
   body{font:14px Arial,sans-serif;color:#202124;margin:0;padding:22px}
   label{display:block;font-weight:bold;margin-top:14px}
   input{box-sizing:border-box;width:100%;padding:9px;margin-top:6px;border:1px solid #dadce0;border-radius:5px;font:inherit}
+  #vendors{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px}
+  #vendors label{margin:0;font-weight:normal}
+  #vendors input{width:auto;margin:0 6px 0 0}
   .current{color:#5f6368;margin:5px 0;overflow-wrap:anywhere}
   .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}
   button{font:inherit;border:1px solid #dadce0;border-radius:5px;padding:9px 14px;background:white;cursor:pointer}
   button.primary{background:#1a73e8;color:white;border-color:#1a73e8}button:disabled{opacity:.55;cursor:default}
   #status,#changes{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.4}
   #status.error{color:#b3261e}
+  #waiting progress{width:100%;accent-color:#1a73e8}
 </style></head><body>
 <form id="form">
   <div id="fields"></div>
+  <fieldset>
+    <legend>Vendor tabs</legend>
+    <div id="vendors"></div>
+    <p class="current">Others, Shipment, Control, and Projects are always created. You can add more vendors later from Purchase Tools → Add vendor tab.</p>
+  </fieldset>
   <div class="actions">
     <button type="button" id="cancel">Cancel</button>
     <button type="button" id="skip">Skip</button>
@@ -546,13 +584,25 @@ const PA = {
   <p id="changes"></p>
   <div class="actions"><button type="button" id="no">No, go back</button><button type="button" class="primary" id="yes">Yes, overwrite</button></div>
 </section>
+<section id="waiting" hidden>
+  <p><strong>Initializing workbook…</strong></p>
+  <progress aria-label="Initializing workbook"></progress>
+  <p>Keep this window open. The result will appear here when setup finishes.</p>
+</section>
 <p id="status" role="status" aria-live="polite"></p>
-<progress id="progress" aria-label="Initializing workbook" style="width:100%;accent-color:#1a73e8" hidden></progress>
 <button type="button" id="close" hidden>Close</button>
 <script>
   const settings=__SETTINGS__;
+  const vendors=__VENDORS__;
+  const previousRun=__RUN__;
   const byId=id=>document.getElementById(id);
   const form=byId('form'),confirm=byId('confirm'),status=byId('status');
+  const options=vendors.map(([name,code])=>{
+    const label=document.createElement('label'),box=document.createElement('input');
+    box.type='checkbox';box.checked=true;box.value=name;
+    label.append(box,name+' ('+code+')');byId('vendors').append(label);
+    return box;
+  });
   const inputs=settings.map(setting=>{
     const label=document.createElement('label'),input=document.createElement('input'),current=document.createElement('p');
     label.textContent=setting.label+' ('+setting.tab+'!'+setting.cell+')';
@@ -563,15 +613,27 @@ const PA = {
     return input;
   });
   let proposed,busy=false;
+  function showResult(result){
+    byId('waiting').hidden=true;
+    status.className=result.state==='failed'?'error':'';
+    status.textContent=result.message;
+    byId('close').hidden=false;
+  }
+  function watch(){
+    google.script.run.withSuccessHandler(result=>{
+      if(result?.state==='running'){setTimeout(watch,2500);return;}
+      showResult(result||{state:'failed',message:'Setup status is unavailable. Check Apps Script Executions before retrying.'});
+    }).withFailureHandler(error=>showResult({state:'failed',message:error.message})).readPurchaseSetupStatus();
+  }
   function run(request){
     if(busy)return;
-    busy=true;form.hidden=true;confirm.hidden=true;byId('progress').hidden=false;
-    status.className='';status.textContent='Setting up the workbook…';
+    busy=true;form.hidden=true;confirm.hidden=true;byId('waiting').hidden=false;
+    status.className='';status.textContent='';
     google.script.run.withSuccessHandler(message=>{
-      byId('progress').hidden=true;status.textContent=message;byId('close').hidden=false;
+      showResult({state:'finished',message});
     }).withFailureHandler(error=>{
-      byId('progress').hidden=true;busy=false;form.hidden=false;status.className='error';status.textContent=error.message;
-    }).setupPurchaseWorkbook(request);
+      byId('waiting').hidden=true;busy=false;form.hidden=false;status.className='error';status.textContent=error.message;
+    }).setupPurchaseWorkbook({...request,vendors:options.filter(box=>box.checked).map(box=>box.value)});
   }
   form.addEventListener('submit',event=>{
     event.preventDefault();
@@ -592,22 +654,61 @@ const PA = {
   byId('no').onclick=()=>{confirm.hidden=true;form.hidden=false;};
   byId('skip').onclick=()=>run({skip:true});
   byId('cancel').onclick=byId('close').onclick=()=>google.script.host.close();
+  if(previousRun){
+    form.hidden=true;
+    if(previousRun.state==='running'){byId('waiting').hidden=false;watch();}
+    else{
+      showResult(previousRun);
+      if(previousRun.state==='failed')form.hidden=false;
+    }
+  }
 </script></body></html>`;
     const safeSettings=JSON.stringify(settings).replace(/</g,'\\u003c');
+    const run=JSON.stringify(this.setupRunStatus(SpreadsheetApp.getActiveSpreadsheet())).replace(/</g,'\\u003c');
     SpreadsheetApp.getUi().showModalDialog(
-      HtmlService.createHtmlOutput(html.replace('__SETTINGS__',()=>safeSettings)).setWidth(510).setHeight(530),
+      HtmlService.createHtmlOutput(html.replace('__RUN__',()=>run)
+        .replace('__VENDORS__',()=>JSON.stringify(vendors)).replace('__SETTINGS__',()=>safeSettings))
+        .setWidth(530).setHeight(650),
       'Initialize workbook'
     );
   },
-  removeEmptyStarter(book,starter){
-    if(!starter||book.getSheets().length<=1||starter.getLastRow()!==0)return;
+  setupRunStatus(book){
+    return JSON.parse(CacheService.getDocumentCache().get('purchase-workbook-setup-'+book.getId())||'null');
+  },
+  initializeWithStatus(book,request){
+    const cache=CacheService.getDocumentCache(),key='purchase-workbook-setup-'+book.getId();
+    const publish=(state,message)=>{
+      try{cache.put(key,JSON.stringify({state,message}),state==='running'?480:3600);}
+      catch(error){console.warn('Could not save initialization status: '+error.message);}
+      if(state==='running')return;
+      try{book.toast('Setup '+state+'. Open Purchase Tools → Initialize workbook for details.','Initialize workbook',30);}
+      catch(error){console.warn('Could not show initialization notification: '+error.message);}
+    };
+    publish('running','');
+    try{
+      const message=this.setup(book,request);
+      publish('finished',message);
+      return message;
+    }catch(error){
+      publish('failed',error.message);
+      throw error;
+    }
+  },
+  isEmptyStarter(starter){
+    if(!starter||!/^(?:Sheet\s*1|Hoja\s*1)$/i.test(starter.getName())||starter.getLastRow()!==0)return false;
     const notes=starter.getRange(1,1,starter.getMaxRows(),starter.getMaxColumns()).getNotes();
-    if(!notes.some(row=>row.some(Boolean)))book.deleteSheet(starter);
+    return !notes.some(row=>row.some(Boolean));
   },
   setup(book,request,templateOnly=false){
     const before=book.getSheets();
     if(!templateOnly&&before.some(sh=>sh.getLastRow()>0||this.vendors.includes(sh.getName())))
       throw Error('Initialize workbook is for blank workbooks. Use Check / repair workbook for an existing project.');
+    const selection=request?.vendors;
+    if(!templateOnly&&selection!==undefined&&(!Array.isArray(selection)||
+        selection.some(name=>!this.vendors.includes(name)||this.requiredVendor(name))))
+      throw Error('Select vendor tabs from the initialization checklist.');
+    const vendors=templateOnly?this.vendorNames(book):
+      this.vendors.filter(name=>selection===undefined||this.requiredVendor(name)||selection.includes(name));
     let settings=[],values=[];
     if(request&&request.skip!==true){
       settings=this.setupSettings(book);
@@ -629,11 +730,15 @@ const PA = {
     }
     this.formulaLocale(book);
     this.upgrade(book); // Insert Ordered on in older Stage 1 copies before applying the new template.
-    this.format(book);
+    const existingVendors=new Set(vendors.filter(name=>book.getSheetByName(name)));
+    // Reuse the open starter tab so setup never deletes the sheet hosting its dialog.
+    const starter=!templateOnly&&before.length===1&&this.isEmptyStarter(before[0])?before[0]:null;
+    this.format(book,[...vendors,'Control','Projects'],starter);
+    if(!templateOnly)this.saveVendors(book.getSheetByName('Control'),vendors);
     const warnings=[];
     const checkboxRule=SpreadsheetApp.newDataValidation().requireCheckbox().setAllowInvalid(false).build();
     const orderedRule=this.dateRule('ordered'),reportedRule=this.dateRule('month');
-    for(const name of this.vendors){
+    for(const name of vendors){
       const sh=book.getSheetByName(name);
       const previous=this.layout(sh);
       if(!previous.priority){
@@ -649,6 +754,7 @@ const PA = {
       }
       sh.setColumnWidth(l.priority,95);
       const purchaseRows=sh.getMaxRows()-l.first+1;
+      if(existingVendors.has(name))sh.getRange(l.first,l.category,purchaseRows,1).setDataValidation(this.categoryRule());
       for(const column of [l.priority,l.paid,l.arrived]){
         sh.getRange(l.first,column,purchaseRows,1).setDataValidation(checkboxRule);
       }
@@ -669,7 +775,7 @@ const PA = {
         book.getSheetByName(setting.tab).getRange(setting.cell).setNumberFormat('@').setValue(values[i]);
       }
     });
-    this.repairGrantLinks(book,this.vendors);
+    this.repairGrantLinks(book,vendors);
     const repaired=this.ids(book);
     try{
       if(!templateOnly)this.enableReceivedLog(book);
@@ -682,9 +788,7 @@ const PA = {
       catch(error){warnings.push('Could not refresh Control links: '+error.message);}
     }
     this.formatControl(book.getSheetByName('Control'),assets);
-    if(!templateOnly&&before.length===1&&/^(?:Sheet\s*1|Hoja\s*1)$/i.test(before[0].getName())){
-      this.removeEmptyStarter(book,before[0]);
-    }
+    SpreadsheetApp.flush();
     const message=[
       'Template formatting, formulas and tracking checked.',
       'ID cells updated or cleared: '+repaired.toLocaleString('en-US'),
@@ -1526,10 +1630,11 @@ const PA = {
   },
   scanProjects(book){
     const folder=this.projectFolder(book),files=folder.getFilesByType(MimeType.GOOGLE_SHEETS);
-    const projects=[],unreadable=[];let count=0;
+    const projects=[],unreadable=[],folderIds=[];
     while(files.hasNext()){
       const file=files.next(),id=file.getId(),fileName=file.getName();
-      count++;
+      if(file.isTrashed())continue;
+      folderIds.push(id);
       try{
         const source=id===book.getId()?book:SpreadsheetApp.openById(id);
         if(!source.getSheetByName('Control'))continue;
@@ -1540,11 +1645,11 @@ const PA = {
         projects.push({id,fileName,name,code,issue,current:id===book.getId()});
       }catch(error){unreadable.push(fileName);}
     }
-    return {folder:folder.getName(),folderId:folder.getId(),count,unreadable,
+    return {folder:folder.getName(),folderId:folder.getId(),count:folderIds.length,folderIds,unreadable,
       projects:projects.sort((a,b)=>a.fileName.localeCompare(b.fileName))};
   },
   syncProjectRegistries(book,request){
-    if(!Array.isArray(request.projects)||request.projects.length<2)throw Error('Select at least two workbooks.');
+    if(!Array.isArray(request.projects)||!request.projects.length)throw Error('Select at least one workbook.');
     const scan=this.scanProjects(book);
     if(scan.folderId!==request.folderId)throw Error('The workbook changed folders. Reopen the dialog and scan again.');
     const selected=new Map(),codes=new Map();
@@ -1555,7 +1660,7 @@ const PA = {
       if(codes.has(p.code))throw Error('Duplicate project code '+p.code+' in '+codes.get(p.code)+' and '+p.fileName+'. Select one or correct the code.');
       selected.set(p.id,p);codes.set(p.code,p.fileName);
     }
-    const externalCodes=new Map();
+    const externalCodes=new Map(),folderIds=new Set(scan.folderIds);
     const plans=[];
     for(const p of selected.values()){
       try{
@@ -1564,7 +1669,8 @@ const PA = {
         if(header.join('|')!=='Project|Spreadsheet URL or ID|Enabled')throw Error('Unexpected Projects headers. Check columns A through C.');
         const last=sh.getLastRow(),registry=last>1?sh.getRange(2,1,last-1,4):null;
         const rows=registry?registry.getValues():[],formulas=registry?registry.getFormulas():[],notes=registry?registry.getNotes():[];
-        const known=new Map(),empty=[],usedCodes=new Map([...selected.values()].map(other=>[other.code,other.id]));
+        const known=new Map(),empty=[],absent=[],unverified=[];
+        const usedCodes=new Map([...selected.values()].map(other=>[other.code,other.id]));
         rows.forEach((row,i)=>{
           if(row[0]===''&&row[1]===''&&(row[2]===''||row[2]===false)&&row[3]===''&&
             !formulas[i].some(Boolean)&&!notes[i].some(Boolean))empty.push(i+2);
@@ -1574,9 +1680,19 @@ const PA = {
             if(known.has(id))throw Error('Projects contains repeated entries for '+selected.get(id).fileName+'. Keep one entry and retry.');
             known.set(id,i+2);return;
           }
+          if(!id)return;
+          if(!folderIds.has(id)){
+            if(!sh.getRange(i+2,1,1,4).canEdit())throw Error('No edit access to Projects row '+(i+2)+'.');
+            absent.push({row:i+2,id});
+            return;
+          }
           if(row[2]!==true)return;
-          if(!externalCodes.has(id))externalCodes.set(id,this.project(SpreadsheetApp.openById(id)).code);
+          if(!externalCodes.has(id)){
+            try{externalCodes.set(id,this.project(SpreadsheetApp.openById(id)).code);}
+            catch(error){externalCodes.set(id,null);}
+          }
           const code=externalCodes.get(id);
+          if(!code){unverified.push(i+2);return;}
           if(usedCodes.has(code)&&usedCodes.get(code)!==id)throw Error('Enabled project in row '+(i+2)+' conflicts with project code '+code+'.');
           usedCodes.set(code,id);
         });
@@ -1594,12 +1710,17 @@ const PA = {
         }
         const extra=next-1-sh.getMaxRows();
         if(extra>0&&!sh.getRange(sh.getMaxRows(),1,1,3).canEdit())throw Error('No edit access to extend Projects.');
-        plans.push({p,sh,extra,entries});
+        plans.push({p,sh,extra,entries,absent,unverified});
       }catch(error){throw Error(p.fileName+': '+error.message+' No project entries were changed.');}
     }
-    return plans.map(({p,sh,extra,entries})=>{
+    return plans.map(({p,sh,extra,entries,absent,unverified})=>{
       try{
+        for(const {row,id} of absent){
+          if(this.projectSourceId(sh.getRange(row,2).getValue(),false)!==id)
+            throw Error('Projects row '+row+' changed. Run sync again.');
+        }
         if(extra>0)sh.insertRowsAfter(sh.getMaxRows(),extra);
+        for(const {row} of absent)sh.getRange(row,1,1,4).clearContent().clearNote();
         const checkbox=SpreadsheetApp.newDataValidation().requireCheckbox().build();
         for(const {row,move,values,update} of entries){
           if(!update)continue;
@@ -1614,7 +1735,9 @@ const PA = {
           if(sh.getRange(row,1,1,3).getValues()[0].some((value,i)=>value!==values[i]))throw Error('Could not verify Projects row '+row+'.');
         }
         const locations=' · Projects rows '+entries.map(e=>e.row).sort((a,b)=>a-b).join(', ');
-        return {fileName:p.fileName,status:(entries.some(e=>e.update)?'Synced':'Already up to date')+locations};
+        const cleanup=absent.length?' · Removed '+absent.length+' workbook entr'+(absent.length===1?'y':'ies')+' outside the folder':'';
+        const kept=unverified.length?' · Could not verify Projects rows '+unverified.join(', ')+'; kept them':'';
+        return {fileName:p.fileName,status:(entries.some(e=>e.update)||absent.length?'Synced':'Already up to date')+locations+cleanup+kept};
       }catch(error){return {fileName:p.fileName,status:'Could not finish: '+error.message};}
     });
   },
@@ -1648,10 +1771,11 @@ const PA = {
       label.append(box,p.issue||(' Include in sync'+(duplicates.has(p.code)?' · duplicate code in folder':'')));
       row.append(title,label);byId('list').append(row);options.push({p,box});
     }
-    const instructions='Select at least two workbooks. Each selected workbook will show the full selection in Projects. Existing entries outside the selection are preserved.';
+    const instructions='Select workbooks to sync. Each selected Projects tab gets the selection and removes entries for workbooks outside this folder or no longer visible here. You can select just one workbook to clean its list.';
     status.textContent=instructions+(scan.unreadable.length?'\\nCould not inspect: '+scan.unreadable.join(', '):'');
-    const update=()=>{sync.disabled=options.filter(o=>o.box.checked).length<2;};
+    const update=()=>{sync.disabled=!options.some(o=>o.box.checked);};
     options.forEach(o=>o.box.onchange=update);
+    update();
     sync.onclick=()=>{
       const projects=options.filter(o=>o.box.checked).map(o=>o.p);
       if(new Set(projects.map(p=>p.code)).size!==projects.length){
@@ -2014,7 +2138,11 @@ function renamePurchaseVendor(request) {
 
 function setupPurchaseWorkbook(request) {
   if(request===undefined)return PA.setupPicker();
-  return PA.run('setup',request);
+  return PA.run('initializeWithStatus',request);
+}
+
+function readPurchaseSetupStatus() {
+  return PA.setupRunStatus(SpreadsheetApp.getActiveSpreadsheet());
 }
 
 function checkPurchaseWorkbook(request,token) {
